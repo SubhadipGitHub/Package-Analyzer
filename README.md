@@ -36,7 +36,7 @@ Built using `Tkinter`, `python-oracledb` (Thin mode), and `re` for SQL/PLSQL par
 
 ## 🔐 Requirements
 
-- Python 3.8 – 3.12  
+- Python 3.10  
 - Oracle Autonomous Database with TLS enabled  
 - Oracle ATP credentials (username/password + TLS connection string)
 

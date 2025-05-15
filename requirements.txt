@@ -1,3 +1,2 @@
-oracledb
+python-oracledb
 cryptography
-cx_Oracle

@@ -11,13 +11,13 @@ with open("config.json", "r") as f:
     DB_USER = config["db_user"]
     DB_PASS = config["db_password"]
     DSN = config["dsn"]
-
+    
 try:
     conn = oracledb.connect(user=DB_USER, password=DB_PASS, dsn=DSN)
     print("✅ Successfully connected using Thin mode!")
     
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM dual")
+    cursor.execute("SELECT SYSDATE FROM dual")
     result = cursor.fetchone()
     print("Query result:", result)
     
