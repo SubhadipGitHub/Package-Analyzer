@@ -207,8 +207,84 @@ app = tk.Tk()
 app.title("Oracle ATP Analyzer")
 app.geometry("900x650")
 
+footer_var = tk.StringVar()
+footer_var.set("Not connected")
+
 notebook = ttk.Notebook(app)
 notebook.pack(expand=True, fill='both')
+
+status_bar = tk.Label(app, textvariable=footer_var, bd=1, relief=tk.SUNKEN, anchor=tk.W)
+status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+
+conn_frame = ttk.Frame(notebook)
+table_frame = ttk.Frame(notebook)
+package_frame = ttk.Frame(notebook)
+pkg_extract_frame = ttk.Frame(notebook)
+
+notebook.add(conn_frame, text="Connection Settings")
+notebook.add(table_frame, text="Analyze Table", state="disabled")
+notebook.add(package_frame, text="Package List", state="disabled")
+notebook.add(pkg_extract_frame, text="Extract Package")
+notebook.tab(2, state="disabled")  # Package List
+notebook.tab(3, state="disabled")  # Extract Package
+
+# --- Connection Tab ---
+
+tk.Label(conn_frame, text="DB Username:").pack(pady=5)
+db_user_var = tk.StringVar(value=DB_USER)
+tk.Entry(conn_frame, textvariable=db_user_var, width=50).pack()
+
+tk.Label(conn_frame, text="DB Password:").pack(pady=5)
+db_pass_var = tk.StringVar(value=DB_PASS)
+tk.Entry(conn_frame, textvariable=db_pass_var, width=50, show="*").pack()
+
+tk.Label(conn_frame, text="DSN (TNS or EZ Connect):").pack(pady=5)
+dsn_var = tk.StringVar(value=DSN)
+tk.Entry(conn_frame, textvariable=dsn_var, width=50).pack()
+
+conn_status_label = tk.Label(conn_frame, text="", fg="green")
+conn_status_label.pack(pady=10)
+
+def test_and_connect():
+    global DB_USER, DB_PASS, DSN
+    try:
+        user = db_user_var.get()
+        password = db_pass_var.get()
+        dsn = dsn_var.get()
+        test_conn = oracledb.connect(user=user, password=password, dsn=dsn)
+        test_conn.close()
+        
+        # Save to globals
+        DB_USER, DB_PASS, DSN = user, password, dsn
+
+        # Update label
+        conn_status_label.config(text=f"Connected as {DB_USER}", fg="green")
+        footer_var.set(f"Connected as {DB_USER}")
+
+        # Enable other tabs
+        notebook.tab(1, state="normal")  # Analyze Table
+        notebook.tab(2, state="normal")  # Package List
+        notebook.tab(3, state="normal")  # Extract Package
+        notebook.hide(0)
+        messagebox.showinfo("Connection Successful", f"Connection {DB_USER} established successfully!")
+
+    except Exception as e:
+        conn_status_label.config(text="Connection failed", fg="red")
+        messagebox.showerror("Connection Failed", str(e))
+
+tk.Button(conn_frame, text="Test & Connect", command=test_and_connect).pack(pady=10)
+
+def save_config():
+    config = {
+        "db_user": db_user_var.get(),
+        "db_password": db_pass_var.get(),
+        "dsn": dsn_var.get()
+    }
+    with open("config.json", "w") as f:
+        json.dump(config, f, indent=4)
+    messagebox.showinfo("Saved", "Connection settings saved to config.json.")
+
+tk.Button(conn_frame, text="Save Settings", command=save_config).pack(pady=5)
 
 # --- Helper for loading schemas ---
 def load_schemas(dropdown):
@@ -222,8 +298,6 @@ def load_schemas(dropdown):
         messagebox.showerror("Error loading schemas", str(e))
 
 # --- Analyze Table Tab ---
-table_frame = ttk.Frame(notebook)
-notebook.add(table_frame, text='Analyze Table')
 
 top_frame = ttk.Frame(table_frame)
 top_frame.pack(padx=10, pady=10, fill="x")
@@ -281,8 +355,6 @@ def export_output():
 ttk.Button(btn_frame, text="Export to CSV", command=export_output).pack(side="left", padx=5)
 
 # --- Package List Tab ---
-package_frame = ttk.Frame(notebook)
-notebook.add(package_frame, text='Package List')
 
 pkg_top_frame = ttk.Frame(package_frame)
 pkg_top_frame.pack(pady=10, fill="x")
@@ -341,8 +413,6 @@ package_text.pack(fill="both", expand=True)
 package_text.config(state='disabled')  # Initially read-only
 
 # --- Extract Package Content Tab ---
-pkg_extract_frame = ttk.Frame(notebook)
-notebook.add(pkg_extract_frame, text="Extract Package")
 
 pkg_form_frame = ttk.Frame(pkg_extract_frame)
 pkg_form_frame.pack(padx=10, pady=10, fill="x")
