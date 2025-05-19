@@ -5,6 +5,7 @@ import json
 import re
 import csv
 from collections import defaultdict
+from PIL import Image, ImageTk
 import oracledb
 
 DEBUG = True  # Set False to disable debug logs
@@ -28,17 +29,24 @@ def load_config():
     try:
         with open("config.json", "r") as f:
             cfg = json.load(f)
+            username_entry.insert(0, cfg.get("db_user", ""))
+            password_entry.insert(0, cfg.get("db_password", ""))
+            dsn_entry.insert(0, cfg.get("dsn", ""))
             return cfg.get("db_user"), cfg.get("db_password"), cfg.get("dsn")
     except:
         return "", "", ""
 
-def save_config(user, password, dsn):
+def save_config():
+    user = username_entry.get()
+    password = password_entry.get()
+    dsn = dsn_entry.get()
     with open("config.json", "w") as f:
         json.dump({
             "db_user": user,
             "db_password": password,
             "dsn": dsn
         }, f, indent=4)
+    load_config()
 
 # ---------------- Database Operations ----------------
 def connect():
@@ -50,12 +58,10 @@ def connect():
     try:
         connectinfo = oracledb.connect(user=DB_USER, password=DB_PASS, dsn=DSN)
         # Update label
-        footer_label.config(text=f"Connected as {DB_USER}",fg="green")
-
-        # Enable other tabs
-        notebook.tab(1, state="normal")  # Analyze Table
-        notebook.tab(2, state="normal")  # Package List
-        notebook.tab(3, state="normal")  # Extract Package
+        footer_label.config(text=f"Connected as {DB_USER}", foreground="green")
+        for i in range(1, 4):
+            notebook.tab(i, state='normal')
+        notebook.select(1)
         notebook.hide(0)
         #messagebox.showinfo("Connection Successful", f"Connection {DB_USER} established successfully!")
         #print(connectinfo)
@@ -387,39 +393,95 @@ def highlight_operations(text_widget, operations):
         for _, line_num, _ in ops:
             text_widget.tag_add("highlight", f"{line_num}.0", f"{line_num}.end")
 
-# ---------------- GUI Setup ----------------
+# ------------------- Main GUI Setup -------------------
 app = tk.Tk()
-app.title("Oracle ATP PL/SQL Analyzer")
-app.geometry("1100x700")
+app.title("Oracle ATP Analyzer")
+app.geometry("800x600")
+style = ttk.Style(app)
+style.theme_use('clam')
+
+# ----------------- Helper GUI functions --------------------
+def load_icon(path, size=(16, 16)):
+    try:
+        img = Image.open(path).resize(size, Image.ANTIALIAS)
+        return ImageTk.PhotoImage(img)
+    except:
+        return None
+
+# Modern tab style
+style.configure("TNotebook", tabposition='n')
+style.configure("TNotebook.Tab", padding=[10, 5], font=('Segoe UI', 10))
+style.configure("TButton", padding=6, relief="flat", background="#007ACC", foreground="white")
+style.map("TButton", background=[('active', '#005F9E')])
 
 notebook = ttk.Notebook(app)
 notebook.pack(fill='both', expand=True)
 
-# ---------------- Tab 1: Connection Settings ----------------
+# ------------------- Load Images -------------------
+logo_img = load_icon("icons/logo.jpg", size=(100, 100))
+conn_icon = load_icon("icons/sample.jpg")
+table_icon = load_icon("icons/sample.jpg")
+pkg_list_icon = load_icon("icons/sample.jpg")
+pkg_extract_icon = load_icon("icons/sample.jpg")
+
+# ------------------- Tabs -------------------
 tab_conn = ttk.Frame(notebook)
-notebook.add(tab_conn, text='Connection Settings')
+tab_table = ttk.Frame(notebook)
+tab_pkg_list = ttk.Frame(notebook)
+tab_pkg_extract = ttk.Frame(notebook)
 
-tk.Label(tab_conn, text="Username:").grid(row=0, column=0, sticky="w")
-username_entry = tk.Entry(tab_conn, width=30)
-username_entry.grid(row=0, column=1, padx=10, pady=5)
+if conn_icon:
+    notebook.add(tab_conn, text=" Connection", image=conn_icon, compound="left")
+else:
+    notebook.add(tab_conn, text=" Connection")
 
-tk.Label(tab_conn, text="Password:").grid(row=1, column=0, sticky="w")
-password_entry = tk.Entry(tab_conn, show="*", width=30)
-password_entry.grid(row=1, column=1, padx=10, pady=5)
+if table_icon:
+    notebook.add(tab_table, text=" Analyze Table", image=table_icon, compound="left")
+else:
+    notebook.add(tab_table, text=" Analyze Table")
 
-tk.Label(tab_conn, text="DSN (e.g., mydb_high):").grid(row=2, column=0, sticky="w")
-dsn_entry = tk.Entry(tab_conn, width=30)
-dsn_entry.grid(row=2, column=1, padx=10, pady=5)
+if pkg_list_icon:
+    notebook.add(tab_pkg_list, text=" Package List", image=pkg_list_icon, compound="left")
+else:
+    notebook.add(tab_pkg_list, text=" Package List")
 
-connect_btn = tk.Button(tab_conn, text="Connect", command=connect)
-connect_btn.grid(row=3, column=1, pady=10)
+if pkg_extract_icon:
+    notebook.add(tab_pkg_extract, text=" Extract Content", image=pkg_extract_icon, compound="left")
+else:
+    notebook.add(tab_pkg_extract, text=" Extract Content")
 
-conn_status = tk.Label(tab_conn, text="Not Connected", fg="red")
-conn_status.grid(row=4, column=1)
+# Disable tabs initially
+notebook.tab(1, state="disabled")
+notebook.tab(2, state="disabled")
+notebook.tab(3, state="disabled")
+
+# ------------------- Tab 1: Connection UI -------------------
+center_frame = ttk.Frame(tab_conn, padding=30)
+center_frame.place(relx=0.5, rely=0.4, anchor='center')
+
+if logo_img:
+    logo_label = tk.Label(center_frame, image=logo_img)
+    logo_label.grid(row=0, column=0, columnspan=2, pady=(0, 20))
+
+ttk.Label(center_frame, text="Username:").grid(row=1, column=0, sticky="e")
+username_entry = ttk.Entry(center_frame, width=30)
+username_entry.grid(row=1, column=1, padx=10, pady=5)
+
+ttk.Label(center_frame, text="Password:").grid(row=2, column=0, sticky="e")
+password_entry = ttk.Entry(center_frame, show="*", width=30)
+password_entry.grid(row=2, column=1, padx=10, pady=5)
+
+ttk.Label(center_frame, text="DSN:").grid(row=3, column=0, sticky="e")
+dsn_entry = ttk.Entry(center_frame, width=30)
+dsn_entry.grid(row=3, column=1, padx=10, pady=5)
+
+connect_btn = ttk.Button(center_frame, text="Connect", command=connect)
+connect_btn.grid(row=4, column=1, pady=10, sticky="e")
+
+# Get the connection details saved
+load_config()
 
 # ---------------- Tab 2: Analyze Table ----------------
-tab_table = ttk.Frame(notebook)
-notebook.add(tab_table, text='Analyze Table')
 
 tk.Label(tab_table, text="Enter Schema Name:").pack(pady=(5,0))
 schema_entry_table = tk.Entry(tab_table, width=30)
@@ -436,8 +498,6 @@ table_output = scrolledtext.ScrolledText(tab_table, wrap=tk.WORD, height=25)
 table_output.pack(fill='both', expand=True, padx=10, pady=5)
 
 # ---------------- Tab 3: Package List ----------------
-tab_pkg_list = ttk.Frame(notebook)
-notebook.add(tab_pkg_list, text='Package List')
 
 tk.Label(tab_pkg_list, text="Enter Schema Name:").pack(pady=(5,0))
 schema_entry_pkg_list = tk.Entry(tab_pkg_list, width=30)
@@ -450,8 +510,6 @@ table_package_list_output = scrolledtext.ScrolledText(tab_pkg_list, wrap=tk.WORD
 table_package_list_output.pack(fill='both', expand=True, padx=10, pady=5)
 
 # ---------------- Tab 4: Extract Package Content ----------------
-tab_pkg_extract = ttk.Frame(notebook)
-notebook.add(tab_pkg_extract, text='Extract Package Content')
 
 tk.Label(tab_pkg_extract, text="Enter Schema Name:").pack(pady=(5,0))
 schema_entry_package = tk.Entry(tab_pkg_extract, width=30)
@@ -469,17 +527,28 @@ pkg_text.pack(fill='both', expand=True, padx=10, pady=5)
 
 # ---------------- Progress Bar -----------------
 
-progress_bar1 = ttk.Progressbar(tab_table, mode='indeterminate')
+style = ttk.Style()
+style.theme_use("clam")  # Better support for custom styles
+
+style.configure("custom.Horizontal.TProgressbar",
+                troughcolor="#E0E0E0",
+                bordercolor="#D0D0D0",
+                background="#0078D7",  # Modern blue
+                lightcolor="#0078D7",
+                darkcolor="#005A9E",
+                thickness=10)
+
+progress_bar1 = ttk.Progressbar(tab_table, style="custom.Horizontal.TProgressbar", mode='indeterminate')
 progress_bar1.pack(fill='x', padx=50, pady=(0, 50))
 progress_bar1.stop()  # make sure it's not running at start
 progress_bar1.pack_forget()  # hide initially
 
-progress_bar2 = ttk.Progressbar(tab_pkg_list, mode='indeterminate')
+progress_bar2 = ttk.Progressbar(tab_pkg_list, style="custom.Horizontal.TProgressbar", mode='indeterminate')
 progress_bar2.pack(fill='x', padx=50, pady=(0, 50))
 progress_bar2.stop()  # make sure it's not running at start
 progress_bar2.pack_forget()  # hide initially
 
-progress_bar3 = ttk.Progressbar(tab_pkg_extract, mode='indeterminate')
+progress_bar3 = ttk.Progressbar(tab_pkg_extract, style="custom.Horizontal.TProgressbar", mode='indeterminate')
 progress_bar3.pack(fill='x', padx=50, pady=(0, 50))
 progress_bar3.stop()  # make sure it's not running at start
 progress_bar3.pack_forget()  # hide initially
@@ -492,4 +561,8 @@ footer_label = tk.Label(footer_frame, text="Not connected", anchor='w', fg="blue
 footer_label.pack(fill='x', padx=5, pady=2)
 
 # ---------------- Start GUI ----------------
+notebook.tab(1, state="disabled")
+notebook.tab(2, state="disabled")
+notebook.tab(3, state="disabled")
+
 app.mainloop()

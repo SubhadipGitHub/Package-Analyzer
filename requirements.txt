@@ -1,2 +1,3 @@
 python-oracledb
 cryptography
+pillow
