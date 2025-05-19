@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import ttk, messagebox, scrolledtext, filedialog
+from tkinter import ttk, messagebox, scrolledtext, filedialog, simpledialog
 import threading
 import json
 import re
@@ -7,13 +7,13 @@ import csv
 from collections import defaultdict
 import oracledb
 
-# Load config once
-with open("config.json", "r") as f:
-    config = json.load(f)
-    DB_USER = config["db_user"]
-    DB_PASS = config["db_password"]
-    DSN = config["dsn"]
+DEBUG = True  # Set False to disable debug logs
 
+def debug_log(msg):
+    if DEBUG:
+        print("[DEBUG]", msg)
+
+# ---------------- Constants and Globals ----------------
 OPERATION_PATTERNS = {
     "SELECT": re.compile(r"\bSELECT\b.*?\bFROM\b\s+(?:\w+\.)?([a-zA-Z0-9_]+)", re.IGNORECASE | re.DOTALL),
     "INSERT": re.compile(r"\bINSERT\s+INTO\s+(?:\w+\.)?([a-zA-Z0-9_]+)", re.IGNORECASE),
@@ -21,8 +21,47 @@ OPERATION_PATTERNS = {
     "DELETE": re.compile(r"\bDELETE\s+FROM\s+(?:\w+\.)?([a-zA-Z0-9_]+)", re.IGNORECASE),
 }
 
+DB_USER = DB_PASS = DSN = None
+
+# ---------------- Configuration I/O ----------------
+def load_config():
+    try:
+        with open("config.json", "r") as f:
+            cfg = json.load(f)
+            return cfg.get("db_user"), cfg.get("db_password"), cfg.get("dsn")
+    except:
+        return "", "", ""
+
+def save_config(user, password, dsn):
+    with open("config.json", "w") as f:
+        json.dump({
+            "db_user": user,
+            "db_password": password,
+            "dsn": dsn
+        }, f, indent=4)
+
+# ---------------- Database Operations ----------------
 def connect():
-    return oracledb.connect(user=DB_USER, password=DB_PASS, dsn=DSN)
+    DB_USER,DB_PASS,DSN = load_config()
+    #print(DB_USER)
+    #print(DB_PASS)
+    #print(DSN)
+
+    try:
+        connectinfo = oracledb.connect(user=DB_USER, password=DB_PASS, dsn=DSN)
+        # Update label
+        footer_label.config(text=f"Connected as {DB_USER}",fg="green")
+
+        # Enable other tabs
+        notebook.tab(1, state="normal")  # Analyze Table
+        notebook.tab(2, state="normal")  # Package List
+        notebook.tab(3, state="normal")  # Extract Package
+        notebook.hide(0)
+        #messagebox.showinfo("Connection Successful", f"Connection {DB_USER} established successfully!")
+        #print(connectinfo)
+        return connectinfo
+    except Exception as e:
+        messagebox.showerror("Connection Failed", str(e))
 
 def fetch_query(query, params=None):
     with connect() as conn:
@@ -31,67 +70,119 @@ def fetch_query(query, params=None):
         return cursor.fetchall()
 
 def get_schema_objects(schema, obj_type):
-    query = "SELECT object_name FROM all_objects WHERE owner = UPPER(:1) AND object_type = :2 ORDER BY object_name"
-    return [row[0] for row in fetch_query(query, [schema, obj_type])]
+    return [row[0] for row in fetch_query(
+        "SELECT object_name FROM all_objects WHERE owner = UPPER(:1) AND object_type = :2 ORDER BY object_name",
+        [schema, obj_type]
+    )]
 
 def get_tables(schema):
-    return [row[0] for row in fetch_query("SELECT table_name FROM all_tables WHERE owner = UPPER(:1) ORDER BY table_name", [schema])]
+    return [row[0] for row in fetch_query(
+        "SELECT table_name FROM all_tables WHERE owner = UPPER(:1) ORDER BY table_name", [schema]
+    )]
 
 def get_sequences(schema):
-    return [row[0] for row in fetch_query("SELECT sequence_name FROM all_sequences WHERE sequence_owner = UPPER(:1) ORDER BY sequence_name", [schema])]
+    return [row[0] for row in fetch_query(
+        "SELECT sequence_name FROM all_sequences WHERE sequence_owner = UPPER(:1) ORDER BY sequence_name", [schema]
+    )]
 
-def get_package_source(schema, package_name):
-    query = """
+def get_package_source(schema, name):
+    return fetch_query("""
         SELECT line, text FROM all_source 
         WHERE owner = UPPER(:1) AND name = UPPER(:2) AND type IN ('PACKAGE BODY', 'PROCEDURE', 'FUNCTION')
         ORDER BY line
-    """
-    rows = fetch_query(query, [schema, package_name])
-    return rows  # list of (line_number, text)
+    """, [schema, name])
 
-def preprocess_source_lines(src_lines):
-    """
-    Combines multiline PL/SQL statements and tracks their starting line numbers.
-    Removes inline comments. Returns list of (start_line, full_statement).
-    """
-    combined = []
-    statement = ""
-    start_line = None
+# ---------------- Text Analysis Helpers ----------------
+def analyze_table():
+    output = []
+    schema = schema_entry_table.get().strip()
+    table_name = table_entry.get().strip()
+    
+    debug_log(f"Schema: {schema}")
+    debug_log(f"Table: {table_name}")
+    
+    if not schema or not table_name:
+        messagebox.showwarning("Input Error", "Please enter both schema and table name.")
+        return
+    
+    try:
+        # Columns
+        cols = fetch_query("""
+            SELECT column_name, data_type, data_length 
+            FROM all_tab_columns 
+            WHERE table_name = UPPER(:1) AND owner = UPPER(:2) 
+            ORDER BY column_id
+        """, [table_name, schema])
+        debug_log(f"Columns found: {len(cols)}")
+        output.append("Columns:")
+        output.extend(f"  - {c[0]} ({c[1]} [{c[2]}])" for c in cols)
+        
+        # Constraints
+        cons = fetch_query("""
+            SELECT ac.constraint_name, ac.constraint_type, acc.column_name
+            FROM all_constraints ac
+            JOIN all_cons_columns acc ON ac.constraint_name = acc.constraint_name AND ac.owner = acc.owner
+            WHERE ac.table_name = UPPER(:1) AND ac.owner = UPPER(:2)
+            ORDER BY ac.constraint_name, acc.position
+        """, [table_name, schema])
+        debug_log(f"Constraints found: {len(cons)}")
+        output.append("\nConstraints:")
+        output.extend(f"  - {c[0]} ({c[1]}) [{c[2]}]" for c in cons)
+        
+        # Indexes
+        idxs = fetch_query("""
+            SELECT ai.index_name, ai.uniqueness, aic.column_name
+            FROM all_indexes ai
+            JOIN all_ind_columns aic ON ai.index_name = aic.index_name AND ai.table_owner = aic.table_owner
+            WHERE ai.table_name = UPPER(:1) AND ai.owner = UPPER(:2)
+            ORDER BY ai.index_name, aic.column_position
+        """, [table_name, schema])
+        debug_log(f"Indexes found: {len(idxs)}")
+        output.append("\nIndexes:")
+        output.extend(f"  - {i[0]} ({i[1]}) [{i[2]}]" for i in idxs)
+        
+        # Record count
+        count_query = f"SELECT COUNT(*) FROM {schema}.{table_name}"
+        debug_log(f"Executing count query: {count_query}")
+        count = fetch_query(count_query)[0][0]
+        debug_log(f"Record count: {count}")
+        output.append(f"\nTotal Records: {count}")
+        
+        # Usage in packages
+        usage = analyze_table_usage(schema, table_name)
+        debug_log(f"Usage found in {len(usage)} entries")
+        output.append("\nUsage in Packages:")
+        pkgs = set()
+        for (tbl, op, pkg), info in sorted(usage.items()):
+            pkgs.add(pkg)
+            output.append(f"  - Package: {pkg}, Operation: {op}, Lines: {', '.join(map(str, info['lines']))}")
+        output.append(f"\nTotal packages using {table_name}: {len(pkgs)}")
+        
+    except Exception as e:
+        debug_log(f"Exception: {e}")
+        output.append(f"\nError retrieving table details: {str(e)}")
+    
+    # Print output for debug (optional)
+    debug_log("Final output lines:")
+    for line in output:
+        debug_log(line)
+    
+    return output
 
-    for line_number, line in src_lines:
-        # Remove comments
-        line_clean = re.sub(r"--.*", "", line).strip()
-        if not line_clean:
-            continue
-
-        if start_line is None:
-            start_line = line_number
-
-        statement += line_clean + " "
-
-        # Consider the statement ends at a semicolon
-        if ";" in line:
-            combined.append((start_line, statement.strip()))
-            statement = ""
-            start_line = None
-
-    if statement:
-        combined.append((start_line or 1, statement.strip()))
-
-    return combined
 
 def analyze_table_usage(schema, table_name):
     results = defaultdict(lambda: {"count": 0, "lines": [], "files": set()})
-
+    debug_log(f"Analyzing usage of table {schema}.{table_name} in packages")
+    
     for pkg in get_schema_objects(schema, 'PACKAGE'):
-        src_lines = get_package_source(schema, pkg)  # [(line_number, text), ...]
-
+        debug_log(f"Checking package: {pkg}")
+        src_lines = get_package_source(schema, pkg)
         if not src_lines:
+            debug_log(f"No source found for package {pkg}")
             continue
-
+        
         for line_number, line_text in src_lines:
-            clean_line = re.sub(r"--.*", "", line_text).strip()  # Strip comments
-
+            clean_line = re.sub(r"--.*", "", line_text).strip()
             for op, pattern in OPERATION_PATTERNS.items():
                 for match in pattern.finditer(clean_line):
                     matched_table = match.group(1).split('.')[-1].upper()
@@ -100,339 +191,92 @@ def analyze_table_usage(schema, table_name):
                         results[key]["count"] += 1
                         results[key]["lines"].append(line_number)
                         results[key]["files"].add(pkg)
-
+                        debug_log(f"Match found in {pkg}: line {line_number}, op {op}")
+    
+    debug_log(f"Total matches found: {sum(len(v['lines']) for v in results.values())}")
     return results
 
-
-def analyze_table_details(schema, table_name):
-    output = []
-    col_query = """
-        SELECT column_name, data_type,data_length FROM all_tab_columns WHERE table_name = UPPER(:1) AND owner = UPPER(:2) ORDER BY column_id
-    """
-    cons_query = """
-        SELECT 
-    ac.constraint_name,
-    ac.constraint_type,
-    acc.column_name
-FROM 
-    all_constraints ac
-JOIN 
-    all_cons_columns acc 
-    ON ac.constraint_name = acc.constraint_name 
-    AND ac.owner = acc.owner
-WHERE 
-    ac.table_name = UPPER(:1)
-    AND ac.owner = UPPER(:2)
-ORDER BY 
-    ac.constraint_name, acc.position
-    """
-    idx_query = """
-        SELECT 
-    ai.index_name,
-    ai.uniqueness,
-    aic.column_name
-FROM 
-    all_indexes ai
-JOIN 
-    all_ind_columns aic 
-    ON ai.index_name = aic.index_name 
-    AND ai.table_owner = aic.table_owner
-WHERE 
-    ai.table_name = UPPER(:1)
-    AND ai.owner = UPPER(:2)
-ORDER BY 
-    ai.index_name, aic.column_position
-    """
-    try:
-        cols = fetch_query(col_query, [table_name, schema])
-        output.append("Columns:")
-        output.extend(f"  - {c[0]} ({c[1]} [{c[2]}])" for c in cols)
-
-        cons = fetch_query(cons_query, [table_name, schema])
-        output.append("\nConstraints:")
-        output.extend(f"  - {c[0]} ({c[1]}) [{c[2]}]" for c in cons)
-
-        idxs = fetch_query(idx_query, [table_name, schema])
-        output.append("\nIndexes:")
-        output.extend(f"  - {i[0]} ({i[1]}) [{i[2]}]" for i in idxs)
-
-        count_query = f"SELECT COUNT(*) FROM {schema}.{table_name}"
-        count = fetch_query(count_query)[0][0]
-        output.append(f"\nTotal Records: {count}")
-    except Exception as e:
-        output.append(f"\nError retrieving table details: {str(e)}")
-    return output
-
-
-def export_to_csv(data, filename="output.csv"):
-    with open(filename, 'w', newline='') as f:
-        writer = csv.writer(f)
-        for line in data:
-            writer.writerow([line])
-
-def update_output(text_widget, lines):
-    text_widget.config(state='normal')
-    text_widget.delete(1.0, tk.END)
-    text_widget.insert(tk.END, "\n".join(lines) + "\n")
-    text_widget.config(state='disabled')
-
-def run_analysis(schema, table_name, output_widget):
-    def start_loader():
-        progress_bar.pack(fill='x', padx=10, pady=(0, 10))
-        progress_bar.start()
-
+def analyze_table_worker():
     def stop_loader():
-        progress_bar.stop()
-        progress_bar.pack_forget()
+        progress_bar1.stop()
+        progress_bar1.pack_forget()
 
-    app.after(0, start_loader)
     try:
-        output = analyze_table_details(schema, table_name)
-        usage = analyze_table_usage(schema, table_name)
-        output.append("\nUsage in Packages:")
-        pkgs = set()
-        for (tbl, op, fname), info in sorted(usage.items()):
-            pkgs.add(fname)
-            output.append(f"  - Package: {fname}, Operation: {op}, Lines: {', '.join(map(str, info['lines']))}")
-        output.append(f"\nTotal packages using {table_name}: {len(pkgs)}")
-        app.after(0, lambda: update_output(output_widget, output))
+        output = analyze_table()
+        def update_ui():
+            table_output.delete('1.0', tk.END)
+            if output:
+                table_output.insert(tk.END, "\n".join(output))
+        app.after(0, update_ui)
     except Exception as e:
         app.after(0, lambda: messagebox.showerror("Error", str(e)))
     finally:
         app.after(0, stop_loader)
 
+def analyze_table_callback():
+    def start_loader():
+        progress_bar1.pack(fill='x', padx=10, pady=(0, 10))
+        progress_bar1.start()
 
-# GUI Setup
-app = tk.Tk()
-app.title("Oracle ATP Analyzer")
-app.geometry("900x650")
+    start_loader()
+    run_in_thread(analyze_table_worker)
 
-footer_var = tk.StringVar()
-footer_var.set("Not connected")
-
-notebook = ttk.Notebook(app)
-notebook.pack(expand=True, fill='both')
-
-status_bar = tk.Label(app, textvariable=footer_var, bd=1, relief=tk.SUNKEN, anchor=tk.W)
-status_bar.pack(side=tk.BOTTOM, fill=tk.X)
-
-conn_frame = ttk.Frame(notebook)
-table_frame = ttk.Frame(notebook)
-package_frame = ttk.Frame(notebook)
-pkg_extract_frame = ttk.Frame(notebook)
-
-notebook.add(conn_frame, text="Connection Settings")
-notebook.add(table_frame, text="Analyze Table", state="disabled")
-notebook.add(package_frame, text="Package List", state="disabled")
-notebook.add(pkg_extract_frame, text="Extract Package")
-notebook.tab(2, state="disabled")  # Package List
-notebook.tab(3, state="disabled")  # Extract Package
-
-# --- Connection Tab ---
-
-tk.Label(conn_frame, text="DB Username:").pack(pady=5)
-db_user_var = tk.StringVar(value=DB_USER)
-tk.Entry(conn_frame, textvariable=db_user_var, width=50).pack()
-
-tk.Label(conn_frame, text="DB Password:").pack(pady=5)
-db_pass_var = tk.StringVar(value=DB_PASS)
-tk.Entry(conn_frame, textvariable=db_pass_var, width=50, show="*").pack()
-
-tk.Label(conn_frame, text="DSN (TNS or EZ Connect):").pack(pady=5)
-dsn_var = tk.StringVar(value=DSN)
-tk.Entry(conn_frame, textvariable=dsn_var, width=50).pack()
-
-conn_status_label = tk.Label(conn_frame, text="", fg="green")
-conn_status_label.pack(pady=10)
-
-def test_and_connect():
-    global DB_USER, DB_PASS, DSN
-    try:
-        user = db_user_var.get()
-        password = db_pass_var.get()
-        dsn = dsn_var.get()
-        test_conn = oracledb.connect(user=user, password=password, dsn=dsn)
-        test_conn.close()
-        
-        # Save to globals
-        DB_USER, DB_PASS, DSN = user, password, dsn
-
-        # Update label
-        conn_status_label.config(text=f"Connected as {DB_USER}", fg="green")
-        footer_var.set(f"Connected as {DB_USER}")
-
-        # Enable other tabs
-        notebook.tab(1, state="normal")  # Analyze Table
-        notebook.tab(2, state="normal")  # Package List
-        notebook.tab(3, state="normal")  # Extract Package
-        notebook.hide(0)
-        messagebox.showinfo("Connection Successful", f"Connection {DB_USER} established successfully!")
-
-    except Exception as e:
-        conn_status_label.config(text="Connection failed", fg="red")
-        messagebox.showerror("Connection Failed", str(e))
-
-tk.Button(conn_frame, text="Test & Connect", command=test_and_connect).pack(pady=10)
-
-def save_config():
-    config = {
-        "db_user": db_user_var.get(),
-        "db_password": db_pass_var.get(),
-        "dsn": dsn_var.get()
-    }
-    with open("config.json", "w") as f:
-        json.dump(config, f, indent=4)
-    messagebox.showinfo("Saved", "Connection settings saved to config.json.")
-
-tk.Button(conn_frame, text="Save Settings", command=save_config).pack(pady=5)
-
-# --- Helper for loading schemas ---
-def load_schemas(dropdown):
+def list_packages():
+    schema = schema_entry_pkg_list.get().strip()
+    print(f"Debug: schema entered for listing packages: '{schema}'")
+    
+    if not schema:
+        messagebox.showwarning("Input Error", "Please enter schema name.")
+        return []
+    
     try:
         with connect() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT DISTINCT owner FROM all_objects ORDER BY owner")
-            schemas = [row[0] for row in cursor.fetchall()]
-            dropdown['values'] = schemas
+            # Use the schema variable, not DB_USER here
+            cursor.execute(
+                "SELECT object_name FROM all_objects WHERE object_type = 'PACKAGE' AND owner = UPPER(:1)",
+                [schema]
+            )
+            packages = [row[0] for row in cursor.fetchall()]
+            print(f"Debug: packages found: {packages}")
+            return packages
     except Exception as e:
-        messagebox.showerror("Error loading schemas", str(e))
-
-# --- Analyze Table Tab ---
-
-top_frame = ttk.Frame(table_frame)
-top_frame.pack(padx=10, pady=10, fill="x")
-
-ttk.Label(top_frame, text="Select Schema:").pack(side="left")
-schema_var_table = tk.StringVar()
-schema_dropdown_table = ttk.Combobox(top_frame, textvariable=schema_var_table, width=20)
-schema_dropdown_table.pack(side="left", padx=5)
-
-ttk.Label(top_frame, text="Select Table:").pack(side="left")
-table_var = tk.StringVar()
-table_dropdown = ttk.Combobox(top_frame, textvariable=table_var, width=40)
-table_dropdown.pack(side="left", padx=5)
-
-load_schemas(schema_dropdown_table)
-
-def on_schema_select_table(event=None):
-    schema = schema_var_table.get()
-    if schema:
-        try:
-            table_dropdown['values'] = get_tables(schema)
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to fetch tables for schema {schema}:\n{e}")
-
-schema_dropdown_table.bind("<<ComboboxSelected>>", on_schema_select_table)
-
-progress_bar = ttk.Progressbar(table_frame, mode='indeterminate')
-progress_bar.pack(fill='x', padx=10, pady=(0, 10))
-progress_bar.stop()  # make sure it's not running at start
-progress_bar.pack_forget()  # hide initially
-
-output_text = scrolledtext.ScrolledText(table_frame, wrap=tk.WORD, height=30)
-output_text.pack(fill="both", expand=True)
-output_text.config(state='disabled')
-
-def on_analyze_table():
-    schema = schema_var_table.get()
-    table_name = table_var.get()
-    if not schema or not table_name:
-        messagebox.showwarning("Missing Input", "Please select both schema and table.")
-        return
-    threading.Thread(target=run_analysis, args=(schema, table_name, output_text), daemon=True).start()
-
-btn_frame = ttk.Frame(top_frame)
-btn_frame.pack(side="left", padx=5)
-
-ttk.Button(btn_frame, text="Analyze Table", command=on_analyze_table).pack(side="left", padx=5)
-
-def export_output():
-    file = filedialog.asksaveasfilename(defaultextension=".csv")
-    if file:
-        content = output_text.get("1.0", tk.END).strip().splitlines()
-        export_to_csv(content, file)
-
-ttk.Button(btn_frame, text="Export to CSV", command=export_output).pack(side="left", padx=5)
-
-# --- Package List Tab ---
-
-pkg_top_frame = ttk.Frame(package_frame)
-pkg_top_frame.pack(pady=10, fill="x")
-
-ttk.Label(pkg_top_frame, text="Select Schema:").pack(side="left")
-schema_var_pkg = tk.StringVar()
-schema_dropdown_pkg = ttk.Combobox(pkg_top_frame, textvariable=schema_var_pkg, width=30)
-schema_dropdown_pkg.pack(side="left", padx=10)
-
-load_schemas(schema_dropdown_pkg)
-
-def refresh_package_info():
-    schema = schema_var_pkg.get()
-    if not schema:
-        messagebox.showwarning("Missing Input", "Please select a schema.")
-    else:
-        try:
-            pkgs = get_schema_objects(schema, "PACKAGE")
-            tbls = get_tables(schema)
-            seqs = get_sequences(schema)
-            package_text.config(state='normal')          # Enable editing to update text
-            package_text.delete(1.0, tk.END)              # Clear previous content
-            
-            package_text.insert(tk.END, f"Packages in schema '{schema}':\n")
-            if pkgs:
-                for p in pkgs:
-                    package_text.insert(tk.END, f"  - {p}\n")
-            else:
-                package_text.insert(tk.END, "  (No packages found)\n")
-
-            package_text.insert(tk.END, f"\nTables in schema '{schema}':\n")
-            if tbls:
-                for t in tbls:
-                    package_text.insert(tk.END, f"  - {t}\n")
-            else:
-                package_text.insert(tk.END, "  (No tables found)\n")
-
-            package_text.insert(tk.END, f"\nSequences in schema '{schema}':\n")
-            if seqs:
-                for s in seqs:
-                    package_text.insert(tk.END, f"  - {s}\n")
-            else:
-                package_text.insert(tk.END, "  (No sequences found)\n")
-
-            package_text.config(state='disabled')         # Disable editing again after updating
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to fetch packages/sequences:\n{str(e)}")
+        print(f"Error in list_packages: {e}")
+        messagebox.showerror("Database Error", f"Failed to list packages: {e}")
+        return []
     
+def list_packages_worker():
+    def stop_loader():
+        progress_bar2.stop()
+        progress_bar2.pack_forget()
 
-# Button to refresh package and sequence info for the selected schema
-ttk.Button(pkg_top_frame, text="Refresh", command=refresh_package_info).pack(side="left", padx=5)
+    try:
+        output = list_packages()
+        def update_ui():
+            table_package_list_output.delete('1.0', tk.END)
+            if output:
+                table_package_list_output.insert(tk.END, "\n".join(output))
+        app.after(0, update_ui)
+    except Exception as e:
+        app.after(0, lambda: messagebox.showerror("Error", str(e)))
+    finally:
+        app.after(0, stop_loader)
 
-# ScrolledText widget to display package and sequence lists
-package_text = scrolledtext.ScrolledText(package_frame, wrap=tk.WORD)
-package_text.pack(fill="both", expand=True)
-package_text.config(state='disabled')  # Initially read-only
+def list_packages_callback():
+    def start_loader():
+        progress_bar2.pack(fill='x', padx=10, pady=(0, 10))
+        progress_bar2.start()
 
-# --- Extract Package Content Tab ---
+    start_loader()
+    run_in_thread(list_packages_worker)
 
-pkg_form_frame = ttk.Frame(pkg_extract_frame)
-pkg_form_frame.pack(padx=10, pady=10, fill="x")
-
-schema_input_var = tk.StringVar()
-package_input_var = tk.StringVar()
-
-ttk.Label(pkg_form_frame, text="Schema:").pack(side="left")
-ttk.Entry(pkg_form_frame, textvariable=schema_input_var, width=30).pack(side="left", padx=5)
-
-ttk.Label(pkg_form_frame, text="Package:").pack(side="left")
-ttk.Entry(pkg_form_frame, textvariable=package_input_var, width=30).pack(side="left", padx=5)
-
-pkg_output_text = scrolledtext.ScrolledText(pkg_extract_frame, wrap=tk.WORD, height=30)
-pkg_output_text.pack(fill="both", expand=True)
-pkg_output_text.config(state="disabled")
+def run_in_thread(func, *args):
+    """Run a function in a thread, used to keep UI responsive."""
+    threading.Thread(target=func, args=args, daemon=True).start()
 
 def extract_package_content():
-    schema = schema_input_var.get()
-    pkg = package_input_var.get()
+    schema = schema_entry_package.get()
+    pkg = package_entry.get()
     if not schema or not pkg:
         messagebox.showwarning("Missing Input", "Please enter both schema and package name.")
         return
@@ -446,38 +290,206 @@ def extract_package_content():
         rows = fetch_query(query, [schema, pkg])
         if not rows:
             raise Exception("No source found for package.")
-
-        pkg_output_text.config(state="normal")
-        pkg_output_text.delete("1.0", tk.END)
-
-        pkg_output_text.tag_configure("highlight", background="#ffffcc")
-
-        # Insert with line numbers and highlight procedures/functions
-        for line_num, text in rows:
-            numbered_line = f"{line_num:>4}: {text.rstrip()}\n"
-            pkg_output_text.insert(tk.END, numbered_line)
-            if re.search(r"\b(PROCEDURE|FUNCTION)\b", text, re.IGNORECASE):
-                line_start = f"{line_num}.0"
-                line_end = f"{line_num}.end"
-                pkg_output_text.tag_add("highlight", line_start, line_end)
-
-        pkg_output_text.config(state="disabled")
-
+        return rows
     except Exception as e:
         messagebox.showerror("Error", str(e))
 
-btn_extract = ttk.Button(pkg_form_frame, text="Extract", command=extract_package_content)
-def jump_to_line():
-    line_num = tk.simpledialog.askinteger("Jump to Line", "Enter line number:")
-    if line_num:
-        index = f"{line_num}.0"
-        pkg_output_text.see(index)
-        pkg_output_text.tag_remove("jump", "1.0", tk.END)
-        pkg_output_text.tag_configure("jump", background="#cceeff")
-        pkg_output_text.tag_add("jump", index, f"{line_num}.end")
+def extract_package_content_worker():
+    def stop_loader():
+        progress_bar3.stop()
+        progress_bar3.pack_forget()
 
-ttk.Button(pkg_form_frame, text="Jump to Line", command=jump_to_line).pack(side="left", padx=5)
-btn_extract.pack(side="left", padx=5)
+    try:
+        output = extract_package_content()
+        def update_ui():
+            pkg_text.delete("1.0", tk.END)
+            if output:              
+                pkg_text.tag_configure("highlight", background="#ffffcc")
+                # Insert with line numbers and highlight procedures/functions
+                for line_num, text in output:
+                    numbered_line = f"{line_num:>4}: {text.rstrip()}\n"
+                    pkg_text.insert(tk.END, numbered_line)
+                    if re.search(r"\b(PROCEDURE|FUNCTION)\b", text, re.IGNORECASE):
+                        line_start = f"{line_num}.0"
+                        line_end = f"{line_num}.end"
+                        pkg_text.tag_add("highlight", line_start, line_end)
+        app.after(0, update_ui)
+    except Exception as e:
+        app.after(0, lambda: messagebox.showerror("Error", str(e)))
+    finally:
+        app.after(0, stop_loader)
 
+def extract_package_content_callback():
+    def start_loader():
+        progress_bar3.pack(fill='x', padx=10, pady=(0, 10))
+        progress_bar3.start()
+
+    start_loader()
+    run_in_thread(extract_package_content_worker)
+
+def extract_table_operations(lines):
+    operations = defaultdict(list)
+
+    for line_num, line in lines:
+        for op, pattern in OPERATION_PATTERNS.items():
+            for match in pattern.finditer(line):
+                table_name = match.group(1)
+                operations[table_name].append((op, line_num, line.strip()))
+
+    return operations
+
+def detect_dynamic_sql_blocks(source_lines):
+    dyn_blocks = []
+    block = []
+    capturing = False
+
+    for line_num, line in source_lines:
+        if not capturing and re.search(r":=\s*('|q'|\")", line):
+            capturing = True
+            block = [(line_num, line)]
+        elif capturing:
+            block.append((line_num, line))
+            if re.search(r"('|q'|\");", line):
+                capturing = False
+                dyn_blocks.append(block)
+                block = []
+
+    return dyn_blocks
+
+def extract_tables_from_block(block):
+    sql = " ".join(line for _, line in block)
+    tables = []
+    for op, pattern in OPERATION_PATTERNS.items():
+        for match in pattern.finditer(sql):
+            tables.append((op, match.group(1)))
+    return tables
+
+def process_dynamic_sql(source_lines):
+    tables = defaultdict(list)
+    blocks = detect_dynamic_sql_blocks(source_lines)
+    for block in blocks:
+        line_start = block[0][0]
+        extracted = extract_tables_from_block(block)
+        for op, table in extracted:
+            tables[table].append((op, line_start, " ".join(line.strip() for _, line in block)))
+    return tables
+
+def merge_operations(static_ops, dynamic_ops):
+    for table, ops in dynamic_ops.items():
+        static_ops[table].extend(ops)
+    return static_ops
+
+def highlight_operations(text_widget, operations):
+    text_widget.tag_remove("highlight", "1.0", tk.END)
+    text_widget.tag_config("highlight", background="yellow", foreground="black")
+
+    for ops in operations.values():
+        for _, line_num, _ in ops:
+            text_widget.tag_add("highlight", f"{line_num}.0", f"{line_num}.end")
+
+# ---------------- GUI Setup ----------------
+app = tk.Tk()
+app.title("Oracle ATP PL/SQL Analyzer")
+app.geometry("1100x700")
+
+notebook = ttk.Notebook(app)
+notebook.pack(fill='both', expand=True)
+
+# ---------------- Tab 1: Connection Settings ----------------
+tab_conn = ttk.Frame(notebook)
+notebook.add(tab_conn, text='Connection Settings')
+
+tk.Label(tab_conn, text="Username:").grid(row=0, column=0, sticky="w")
+username_entry = tk.Entry(tab_conn, width=30)
+username_entry.grid(row=0, column=1, padx=10, pady=5)
+
+tk.Label(tab_conn, text="Password:").grid(row=1, column=0, sticky="w")
+password_entry = tk.Entry(tab_conn, show="*", width=30)
+password_entry.grid(row=1, column=1, padx=10, pady=5)
+
+tk.Label(tab_conn, text="DSN (e.g., mydb_high):").grid(row=2, column=0, sticky="w")
+dsn_entry = tk.Entry(tab_conn, width=30)
+dsn_entry.grid(row=2, column=1, padx=10, pady=5)
+
+connect_btn = tk.Button(tab_conn, text="Connect", command=connect)
+connect_btn.grid(row=3, column=1, pady=10)
+
+conn_status = tk.Label(tab_conn, text="Not Connected", fg="red")
+conn_status.grid(row=4, column=1)
+
+# ---------------- Tab 2: Analyze Table ----------------
+tab_table = ttk.Frame(notebook)
+notebook.add(tab_table, text='Analyze Table')
+
+tk.Label(tab_table, text="Enter Schema Name:").pack(pady=(5,0))
+schema_entry_table = tk.Entry(tab_table, width=30)
+schema_entry_table.pack(pady=(0,5))
+
+tk.Label(tab_table, text="Enter Table Name:").pack(pady=5)
+table_entry = tk.Entry(tab_table, width=40)
+table_entry.pack()
+
+analyze_btn = tk.Button(tab_table, text="Analyze Table", command=analyze_table_callback)
+analyze_btn.pack(pady=5)
+
+table_output = scrolledtext.ScrolledText(tab_table, wrap=tk.WORD, height=25)
+table_output.pack(fill='both', expand=True, padx=10, pady=5)
+
+# ---------------- Tab 3: Package List ----------------
+tab_pkg_list = ttk.Frame(notebook)
+notebook.add(tab_pkg_list, text='Package List')
+
+tk.Label(tab_pkg_list, text="Enter Schema Name:").pack(pady=(5,0))
+schema_entry_pkg_list = tk.Entry(tab_pkg_list, width=30)
+schema_entry_pkg_list.pack(pady=(0,5))
+
+refresh_btn = tk.Button(tab_pkg_list, text="Refresh Package List", command=list_packages_callback)
+refresh_btn.pack(pady=5)
+
+table_package_list_output = scrolledtext.ScrolledText(tab_pkg_list, wrap=tk.WORD, height=25)
+table_package_list_output.pack(fill='both', expand=True, padx=10, pady=5)
+
+# ---------------- Tab 4: Extract Package Content ----------------
+tab_pkg_extract = ttk.Frame(notebook)
+notebook.add(tab_pkg_extract, text='Extract Package Content')
+
+tk.Label(tab_pkg_extract, text="Enter Schema Name:").pack(pady=(5,0))
+schema_entry_package = tk.Entry(tab_pkg_extract, width=30)
+schema_entry_package.pack(pady=(0,5))
+
+tk.Label(tab_pkg_extract, text="Enter Package Name:").pack(pady=5)
+package_entry = tk.Entry(tab_pkg_extract, width=40)
+package_entry.pack()
+
+analyze_pkg_btn = tk.Button(tab_pkg_extract, text="Extract Package Content", command=extract_package_content_callback)
+analyze_pkg_btn.pack(pady=5)
+
+pkg_text = scrolledtext.ScrolledText(tab_pkg_extract, wrap=tk.WORD)
+pkg_text.pack(fill='both', expand=True, padx=10, pady=5)
+
+# ---------------- Progress Bar -----------------
+
+progress_bar1 = ttk.Progressbar(tab_table, mode='indeterminate')
+progress_bar1.pack(fill='x', padx=50, pady=(0, 50))
+progress_bar1.stop()  # make sure it's not running at start
+progress_bar1.pack_forget()  # hide initially
+
+progress_bar2 = ttk.Progressbar(tab_pkg_list, mode='indeterminate')
+progress_bar2.pack(fill='x', padx=50, pady=(0, 50))
+progress_bar2.stop()  # make sure it's not running at start
+progress_bar2.pack_forget()  # hide initially
+
+progress_bar3 = ttk.Progressbar(tab_pkg_extract, mode='indeterminate')
+progress_bar3.pack(fill='x', padx=50, pady=(0, 50))
+progress_bar3.stop()  # make sure it's not running at start
+progress_bar3.pack_forget()  # hide initially
+
+# ---------------- Footer Status ----------------
+footer_frame = tk.Frame(app)
+footer_frame.pack(fill='x', side='bottom')
+
+footer_label = tk.Label(footer_frame, text="Not connected", anchor='w', fg="blue")
+footer_label.pack(fill='x', padx=5, pady=2)
+
+# ---------------- Start GUI ----------------
 app.mainloop()
-
