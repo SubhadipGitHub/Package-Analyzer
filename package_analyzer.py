@@ -6,6 +6,7 @@ import re
 import csv
 from collections import defaultdict
 from PIL import Image, ImageTk
+import os
 import oracledb
 
 DEBUG = True  # Set False to disable debug logs
@@ -23,6 +24,10 @@ OPERATION_PATTERNS = {
 }
 
 DB_USER = DB_PASS = DSN = None
+
+# Get the directory where the current script resides
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
 
 # ---------------- Configuration I/O ----------------
 def load_config():
@@ -46,7 +51,6 @@ def save_config():
             "db_password": password,
             "dsn": dsn
         }, f, indent=4)
-    load_config()
 
 # ---------------- Database Operations ----------------
 def connect():
@@ -57,17 +61,40 @@ def connect():
 
     try:
         connectinfo = oracledb.connect(user=DB_USER, password=DB_PASS, dsn=DSN)
-        # Update label
-        footer_label.config(text=f"Connected as {DB_USER}", foreground="green")
-        for i in range(1, 4):
-            notebook.tab(i, state='normal')
-        notebook.select(1)
-        notebook.hide(0)
-        #messagebox.showinfo("Connection Successful", f"Connection {DB_USER} established successfully!")
+        
         #print(connectinfo)
         return connectinfo
     except Exception as e:
         messagebox.showerror("Connection Failed", str(e))
+
+def connect_worker():
+    def stop_loader():
+        progress_bar1.stop()
+        progress_bar1.pack_forget()
+
+    try:
+        save_config()        
+        def update_ui():
+            # Update label
+            footer_label.config(text=f"Connected as {DB_USER}", foreground="green")
+            for i in range(1, 4):
+                notebook.tab(i, state='normal')
+            notebook.select(1)
+            notebook.hide(0)
+            #messagebox.showinfo("Connection Successful", f"Connection {DB_USER} established successfully!")
+        app.after(0, update_ui)
+    except Exception as e:
+        app.after(0, lambda: messagebox.showerror("Error", str(e)))
+    finally:
+        app.after(0, stop_loader)
+
+def connect_callback():
+    def start_loader():
+        progress_bar1.pack(fill='x', padx=10, pady=(0, 10))
+        progress_bar1.start()
+
+    start_loader()
+    run_in_thread(connect_worker)
 
 def fetch_query(query, params=None):
     with connect() as conn:
@@ -103,27 +130,29 @@ def analyze_table():
     output = []
     schema = schema_entry_table.get().strip()
     table_name = table_entry.get().strip()
-    
-    debug_log(f"Schema: {schema}")
-    debug_log(f"Table: {table_name}")
-    
+
+    debug_log(f"[INPUT] Schema: {schema}")
+    debug_log(f"[INPUT] Table: {table_name}")
+
     if not schema or not table_name:
         messagebox.showwarning("Input Error", "Please enter both schema and table name.")
         return
-    
+
     try:
-        # Columns
+        # --- Columns ---
+        debug_log("[STEP] Fetching columns")
         cols = fetch_query("""
             SELECT column_name, data_type, data_length 
             FROM all_tab_columns 
             WHERE table_name = UPPER(:1) AND owner = UPPER(:2) 
             ORDER BY column_id
         """, [table_name, schema])
-        debug_log(f"Columns found: {len(cols)}")
+        debug_log(f"[RESULT] Columns found: {len(cols)}")
         output.append("Columns:")
         output.extend(f"  - {c[0]} ({c[1]} [{c[2]}])" for c in cols)
-        
-        # Constraints
+
+        # --- Constraints ---
+        debug_log("[STEP] Fetching constraints")
         cons = fetch_query("""
             SELECT ac.constraint_name, ac.constraint_type, acc.column_name
             FROM all_constraints ac
@@ -131,11 +160,12 @@ def analyze_table():
             WHERE ac.table_name = UPPER(:1) AND ac.owner = UPPER(:2)
             ORDER BY ac.constraint_name, acc.position
         """, [table_name, schema])
-        debug_log(f"Constraints found: {len(cons)}")
+        debug_log(f"[RESULT] Constraints found: {len(cons)}")
         output.append("\nConstraints:")
         output.extend(f"  - {c[0]} ({c[1]}) [{c[2]}]" for c in cons)
-        
-        # Indexes
+
+        # --- Indexes ---
+        debug_log("[STEP] Fetching indexes")
         idxs = fetch_query("""
             SELECT ai.index_name, ai.uniqueness, aic.column_name
             FROM all_indexes ai
@@ -143,20 +173,81 @@ def analyze_table():
             WHERE ai.table_name = UPPER(:1) AND ai.owner = UPPER(:2)
             ORDER BY ai.index_name, aic.column_position
         """, [table_name, schema])
-        debug_log(f"Indexes found: {len(idxs)}")
+        debug_log(f"[RESULT] Indexes found: {len(idxs)}")
         output.append("\nIndexes:")
         output.extend(f"  - {i[0]} ({i[1]}) [{i[2]}]" for i in idxs)
-        
-        # Record count
-        count_query = f"SELECT COUNT(*) FROM {schema}.{table_name}"
-        debug_log(f"Executing count query: {count_query}")
-        count = fetch_query(count_query)[0][0]
-        debug_log(f"Record count: {count}")
-        output.append(f"\nTotal Records: {count}")
-        
-        # Usage in packages
+
+        # --- Sequences Used ---
+        debug_log("[STEP] Checking sequences used")
+        output.append("\nSequences Used:")
+        used_sequences = set()
+        trigger_seq_map = {}
+        col_seq_map = {}
+
+        # --- From triggers ---
+        debug_log("[STEP] Analyzing triggers for sequences")
+        triggers = fetch_query("""
+            SELECT trigger_name, trigger_body
+            FROM all_triggers
+            WHERE table_owner = UPPER(:1)
+            AND table_name = UPPER(:2)
+        """, [schema, table_name])
+        debug_log(f"[RESULT] Triggers found: {len(triggers)}")
+        for trigger_name, trigger_body in triggers:
+            if trigger_body:
+                try:
+                    body_str = str(trigger_body)
+                    matches = re.findall(r"(\w+)\.(NEXTVAL|CURRVAL)", body_str.upper())
+                    debug_log(f"[TRIGGER] {trigger_name} uses sequences: {matches}")
+                    for seq_name, _ in matches:
+                        used_sequences.add(seq_name)
+                        trigger_seq_map.setdefault(seq_name, []).append(trigger_name)
+                except Exception as e:
+                    debug_log(f"[ERROR] Failed to read trigger {trigger_name}: {e}")
+
+        # --- From default column values ---
+        debug_log("[STEP] Analyzing default column values for sequences")
+        defaults = fetch_query("""
+            SELECT column_name, data_default
+            FROM all_tab_columns 
+            WHERE table_name = UPPER(:1)
+            AND owner = UPPER(:2)
+        """, [table_name, schema])
+        for col, default in defaults:
+            if default:
+                matches = re.findall(r"(\w+)\.NEXTVAL", default, re.IGNORECASE)
+                if matches:
+                    debug_log(f"[COLUMN] {col} default uses sequences: {matches}")
+                for seq in matches:
+                    seq_name = seq.upper()
+                    used_sequences.add(seq_name)
+                    col_seq_map[seq_name] = col
+
+        if not used_sequences:
+            debug_log("[RESULT] No sequences found")
+            output.append("  - No sequences detected.")
+        else:
+            for seq in sorted(used_sequences):
+                debug_log(f"[STEP] Fetching info for sequence: {seq}")
+                seq_info = fetch_query("""
+                    SELECT sequence_name, increment_by, last_number
+                    FROM all_sequences
+                    WHERE sequence_owner = UPPER(:1)
+                      AND sequence_name = UPPER(:2)
+                """, [schema, seq])
+                if seq_info:
+                    sname, incr, last = seq_info[0]
+                    col = col_seq_map.get(seq, "Unknown")
+                    output.append(f"  - {sname} -> Column: {col}, Current Value: {last}, Next Value: {last + incr}, Increment: {incr}")
+                    debug_log(f"[SEQUENCE] {sname} -> Current: {last}, Next: {last + incr}, Increment: {incr}")
+                else:
+                    debug_log(f"[WARN] Sequence {seq} not found in all_sequences")
+                    output.append(f"  - {seq} -> Not found in all_sequences")
+
+        # --- Usage in packages ---
+        debug_log("[STEP] Analyzing usage in packages")
         usage = analyze_table_usage(schema, table_name)
-        debug_log(f"Usage found in {len(usage)} entries")
+        debug_log(f"[RESULT] Usage found in {len(usage)} entries")
         output.append("\nUsage in Packages:")
         pkgs = set()
         for (tbl, op, pkg), info in sorted(usage.items()):
@@ -164,17 +255,23 @@ def analyze_table():
             output.append(f"  - Package: {pkg}, Operation: {op}, Lines: {', '.join(map(str, info['lines']))}")
         output.append(f"\nTotal packages using {table_name}: {len(pkgs)}")
         
+        # --- Record count ---
+        count_query = f"SELECT COUNT(*) FROM {schema}.{table_name}"
+        debug_log(f"[STEP] Executing count query: {count_query}")
+        count = fetch_query(count_query)[0][0]
+        debug_log(f"[RESULT] Record count: {count}")
+        output.append(f"\nTotal Records: {count}")
+
     except Exception as e:
-        debug_log(f"Exception: {e}")
+        debug_log(f"[ERROR] Exception during analysis: {e}")
         output.append(f"\nError retrieving table details: {str(e)}")
-    
-    # Print output for debug (optional)
-    debug_log("Final output lines:")
+
+    # --- Final debug log output ---
+    debug_log("[STEP] Final output lines:")
     for line in output:
         debug_log(line)
-    
-    return output
 
+    return output
 
 def analyze_table_usage(schema, table_name):
     results = defaultdict(lambda: {"count": 0, "lines": [], "files": set()})
@@ -398,14 +495,18 @@ app = tk.Tk()
 app.title("Oracle ATP Analyzer")
 app.geometry("800x600")
 style = ttk.Style(app)
-style.theme_use('clam')
+style.theme_use('default')
 
 # ----------------- Helper GUI functions --------------------
 def load_icon(path, size=(16, 16)):
     try:
-        img = Image.open(path).resize(size, Image.ANTIALIAS)
+        # Construct the relative path to the icons folder
+        icon_path = os.path.join(BASE_DIR, "icons", path)
+        print(f"Trying to load image from: {icon_path}")
+        img = Image.open(icon_path).resize(size, Image.Resampling.LANCZOS)
         return ImageTk.PhotoImage(img)
-    except:
+    except Exception as e:
+        print(f"Exception while loading image '{path}': {e}")
         return None
 
 # Modern tab style
@@ -418,11 +519,11 @@ notebook = ttk.Notebook(app)
 notebook.pack(fill='both', expand=True)
 
 # ------------------- Load Images -------------------
-logo_img = load_icon("icons/logo.jpg", size=(100, 100))
-conn_icon = load_icon("icons/sample.jpg")
-table_icon = load_icon("icons/sample.jpg")
-pkg_list_icon = load_icon("icons/sample.jpg")
-pkg_extract_icon = load_icon("icons/sample.jpg")
+logo_img = load_icon("logo.jpg", size=(100, 100))
+conn_icon = load_icon("db_icon.png")
+table_icon = load_icon("sql_analyzer.png")
+pkg_list_icon = load_icon("sql_analyzer.png")
+pkg_extract_icon = load_icon("sql_analyzer.png")
 
 # ------------------- Tabs -------------------
 tab_conn = ttk.Frame(notebook)
@@ -475,8 +576,8 @@ ttk.Label(center_frame, text="DSN:").grid(row=3, column=0, sticky="e")
 dsn_entry = ttk.Entry(center_frame, width=30)
 dsn_entry.grid(row=3, column=1, padx=10, pady=5)
 
-connect_btn = ttk.Button(center_frame, text="Connect", command=connect)
-connect_btn.grid(row=4, column=1, pady=10, sticky="e")
+connect_btn = ttk.Button(center_frame, text="Connect", command=connect_callback)
+connect_btn.grid(row=4, column=1, pady=10, padx=10, sticky="e")
 
 # Get the connection details saved
 load_config()
@@ -528,7 +629,7 @@ pkg_text.pack(fill='both', expand=True, padx=10, pady=5)
 # ---------------- Progress Bar -----------------
 
 style = ttk.Style()
-style.theme_use("clam")  # Better support for custom styles
+style.theme_use("default")  # Better support for custom styles
 
 style.configure("custom.Horizontal.TProgressbar",
                 troughcolor="#E0E0E0",
@@ -557,7 +658,7 @@ progress_bar3.pack_forget()  # hide initially
 footer_frame = tk.Frame(app)
 footer_frame.pack(fill='x', side='bottom')
 
-footer_label = tk.Label(footer_frame, text="Not connected", anchor='w', fg="blue")
+footer_label = tk.Label(footer_frame, text="Not connected", anchor='w', fg="red")
 footer_label.pack(fill='x', padx=5, pady=2)
 
 # ---------------- Start GUI ----------------
