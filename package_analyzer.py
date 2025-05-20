@@ -34,11 +34,20 @@ def load_config():
     try:
         with open("config.json", "r") as f:
             cfg = json.load(f)
+
+            # Clear existing text first
+            username_entry.delete(0, tk.END)
+            password_entry.delete(0, tk.END)
+            dsn_entry.delete(0, tk.END)
+
+            # Insert loaded values
             username_entry.insert(0, cfg.get("db_user", ""))
             password_entry.insert(0, cfg.get("db_password", ""))
             dsn_entry.insert(0, cfg.get("dsn", ""))
+
             return cfg.get("db_user"), cfg.get("db_password"), cfg.get("dsn")
-    except:
+    except Exception as e:
+        debug_log(f"[ERROR] Failed to load config: {e}")
         return "", "", ""
 
 def save_config():
@@ -54,18 +63,20 @@ def save_config():
 
 # ---------------- Database Operations ----------------
 def connect():
-    DB_USER,DB_PASS,DSN = load_config()
-    #print(DB_USER)
-    #print(DB_PASS)
-    #print(DSN)
-
+    DB_USER, DB_PASS, DSN = load_config()
     try:
-        connectinfo = oracledb.connect(user=DB_USER, password=DB_PASS, dsn=DSN)
-        
-        #print(connectinfo)
-        return connectinfo
+        conn = oracledb.connect(user=DB_USER, password=DB_PASS, dsn=DSN)
+
+        # Query for DB name (service_name)
+        cursor = conn.cursor()
+        cursor.execute("SELECT SYS_CONTEXT('USERENV','SERVICE_NAME') FROM dual")
+        db_name = cursor.fetchone()[0]
+
+        return conn, (DB_USER, db_name)
     except Exception as e:
         messagebox.showerror("Connection Failed", str(e))
+        return None, (None, None)
+
 
 def connect_worker():
     def stop_loader():
@@ -73,20 +84,23 @@ def connect_worker():
         progress_bar1.pack_forget()
 
     try:
-        save_config()        
-        def update_ui():
-            # Update label
-            footer_label.config(text=f"Connected as {DB_USER}", foreground="green")
-            for i in range(1, 4):
-                notebook.tab(i, state='normal')
-            notebook.select(1)
-            notebook.hide(0)
-            #messagebox.showinfo("Connection Successful", f"Connection {DB_USER} established successfully!")
-        app.after(0, update_ui)
+        save_config()
+        conn, (username, dbname) = connect()
+        if conn:
+            def update_ui():
+                footer_label.config(text=f"Connected as {username} @ {dbname}", foreground="green")
+                for i in range(1, 4):
+                    notebook.tab(i, state='normal')
+                notebook.select(1)
+                notebook.tab(0, state='disabled')
+            app.after(0, update_ui)
     except Exception as e:
-        app.after(0, lambda: messagebox.showerror("Error", str(e)))
+        err_msg = str(e)
+        app.after(0, lambda: messagebox.showerror("Error", err_msg))
     finally:
         app.after(0, stop_loader)
+
+
 
 def connect_callback():
     def start_loader():
@@ -97,8 +111,11 @@ def connect_callback():
     run_in_thread(connect_worker)
 
 def fetch_query(query, params=None):
-    with connect() as conn:
-        cursor = conn.cursor()
+    conn, _ = connect()  # We only need the connection object here
+    if not conn:
+        raise Exception("Database connection failed.")
+    
+    with conn.cursor() as cursor:
         cursor.execute(query, params or [])
         return cursor.fetchall()
 
@@ -307,9 +324,11 @@ def analyze_table_worker():
     try:
         output = analyze_table()
         def update_ui():
+            table_output.config(state=tk.NORMAL)      # Enable editing temporarily
             table_output.delete('1.0', tk.END)
             if output:
                 table_output.insert(tk.END, "\n".join(output))
+            table_output.config(state=tk.DISABLED)    # Disable editing again
         app.after(0, update_ui)
     except Exception as e:
         app.after(0, lambda: messagebox.showerror("Error", str(e)))
@@ -356,9 +375,11 @@ def list_packages_worker():
     try:
         output = list_packages()
         def update_ui():
+            table_package_list_output.config(state=tk.NORMAL)
             table_package_list_output.delete('1.0', tk.END)
             if output:
                 table_package_list_output.insert(tk.END, "\n".join(output))
+            table_package_list_output.config(state=tk.DISABLED)    # Disable editing again
         app.after(0, update_ui)
     except Exception as e:
         app.after(0, lambda: messagebox.showerror("Error", str(e)))
@@ -405,6 +426,7 @@ def extract_package_content_worker():
     try:
         output = extract_package_content()
         def update_ui():
+            pkg_text.config(state=tk.NORMAL)      # Enable editing temporarily
             pkg_text.delete("1.0", tk.END)
             if output:              
                 pkg_text.tag_configure("highlight", background="#ffffcc")
@@ -416,6 +438,7 @@ def extract_package_content_worker():
                         line_start = f"{line_num}.0"
                         line_end = f"{line_num}.end"
                         pkg_text.tag_add("highlight", line_start, line_end)
+            pkg_text.config(state=tk.DISABLED)    # Disable editing again
         app.after(0, update_ui)
     except Exception as e:
         app.after(0, lambda: messagebox.showerror("Error", str(e)))
@@ -597,6 +620,7 @@ analyze_btn.pack(pady=5)
 
 table_output = scrolledtext.ScrolledText(tab_table, wrap=tk.WORD, height=25)
 table_output.pack(fill='both', expand=True, padx=10, pady=5)
+table_output.config(state=tk.DISABLED)    # Disable editing setup
 
 # ---------------- Tab 3: Package List ----------------
 
@@ -609,6 +633,7 @@ refresh_btn.pack(pady=5)
 
 table_package_list_output = scrolledtext.ScrolledText(tab_pkg_list, wrap=tk.WORD, height=25)
 table_package_list_output.pack(fill='both', expand=True, padx=10, pady=5)
+table_package_list_output.config(state=tk.DISABLED)    # Disable editing setup
 
 # ---------------- Tab 4: Extract Package Content ----------------
 
@@ -625,6 +650,7 @@ analyze_pkg_btn.pack(pady=5)
 
 pkg_text = scrolledtext.ScrolledText(tab_pkg_extract, wrap=tk.WORD)
 pkg_text.pack(fill='both', expand=True, padx=10, pady=5)
+pkg_text.config(state=tk.DISABLED)    # Disable editing setup
 
 # ---------------- Progress Bar -----------------
 
