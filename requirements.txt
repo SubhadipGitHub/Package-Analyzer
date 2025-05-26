@@ -1,3 +1,4 @@
-python-oracledb
+oracledb
 cryptography
 pillow
+pyinstaller
