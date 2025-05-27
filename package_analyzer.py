@@ -1055,33 +1055,37 @@ def on_sql_select(event=None):
         editor.insert(tk.END, content if content else "")
         apply_syntax_highlighting()
 
-def select_sql_block_in_editor(sql_text):
-    editor.tag_remove(tk.SEL, "1.0", tk.END)  # Clear previous selection
+def select_sql_block_in_editor(start_char_idx, end_char_idx):
+    editor.tag_remove(tk.SEL, "1.0", tk.END)
 
-    if not sql_text.strip():
-        return
+    content = editor.get("1.0", tk.END)
 
-    # Search for the SQL text in editor content
-    start_idx = editor.search(sql_text, "1.0", tk.END, nocase=True, regexp=False)
+    # Calculate start line/column
+    start_line = content.count('\n', 0, start_char_idx)
+    last_newline_before_start = content.rfind('\n', 0, start_char_idx)
+    start_col = start_char_idx if last_newline_before_start == -1 else start_char_idx - (last_newline_before_start + 1)
 
-    if not start_idx:
-        return  # Not found
+    # Calculate end line/column
+    end_line = content.count('\n', 0, end_char_idx)
+    last_newline_before_end = content.rfind('\n', 0, end_char_idx)
+    end_col = end_char_idx if last_newline_before_end == -1 else end_char_idx - (last_newline_before_end + 1)
 
-    # Calculate end index based on length of sql_text
-    end_idx = editor.index(f"{start_idx} + {len(sql_text)}c")
+    start_index = f"{start_line + 1}.{start_col}"
+    end_index = f"{end_line + 1}.{end_col}"
 
-    editor.tag_add(tk.SEL, start_idx, end_idx)
-    editor.mark_set(tk.INSERT, end_idx)
-    editor.see(start_idx)
+    editor.tag_add(tk.SEL, start_index, end_index)
+    editor.mark_set(tk.INSERT, end_index)
+    editor.see(start_index)
     editor.focus_set()
 
 def run_sql():
-    query = extract_sql_from_cursor()
-    select_sql_block_in_editor(query)
+    query, start_pos, end_pos = extract_sql_from_cursor()
 
-    if not query:
+    if not query.strip():
         messagebox.showwarning("Empty Query", "No SQL found to run from cursor position.")
         return
+
+    select_sql_block_in_editor(start_pos, end_pos)
 
     debug_log(f"Running trimmed query: {query}")
     result_label.config(text="⏳ Executing query...")
@@ -1101,7 +1105,7 @@ def run_sql():
 
     # Run query
     start_time = time.time()
-    cols, data = run_sql_query(query)
+    cols, data = run_sql_query(query.rstrip(';').strip()) # Strip ; while running query in DB
     end_time = time.time()
     elapsed = end_time - start_time
 
@@ -1234,38 +1238,36 @@ def highlight_error_line(query):
 
 def extract_sql_from_cursor():
     full_text = editor.get("1.0", tk.END)
-    selection = editor.tag_ranges(tk.SEL)
-
-    # Step 1: If there's a selected block, return it
-    if selection:
-        selected_text = editor.get(selection[0], selection[1])
-        cleaned = remove_comments(selected_text).strip()
-        debug_log(f"SQL to execute (from selection):\n{cleaned}")
-        return cleaned
-
-    # Step 2: Else, run block around the cursor
     cursor_index = editor.index(tk.INSERT)
     cursor_line, cursor_col = map(int, cursor_index.split('.'))
-    lines = full_text.splitlines()
 
-    # Character offset from start
+    # Flat char position
+    lines = full_text.splitlines()
     char_pos = sum(len(line) + 1 for line in lines[:cursor_line - 1]) + cursor_col
 
-    # Find SQL block between nearest semicolons
-    before_cursor = full_text[:char_pos]
-    after_cursor = full_text[char_pos:]
+    # Slice before/after cursor
+    before = full_text[:char_pos]
+    after = full_text[char_pos:]
 
-    last_semicolon = before_cursor.rfind(';')
-    next_semicolon = after_cursor.find(';')
+    # Scan backwards for SQL keyword start (we include common DML/DDL keywords)
+    sql_keywords = r'\b(SELECT|INSERT|UPDATE|DELETE|CREATE|ALTER|DROP|WITH|MERGE|BEGIN)\b'
+    keyword_matches = list(re.finditer(sql_keywords, before, flags=re.IGNORECASE))
 
-    start_pos = last_semicolon + 1 if last_semicolon != -1 else 0
+    if not keyword_matches:
+        return "", -1, -1
+
+    last_keyword = keyword_matches[-1]
+    start_pos = last_keyword.start()
+
+    # Find next semicolon (to mark statement end)
+    next_semicolon = after.find(';')
     end_pos = char_pos + next_semicolon if next_semicolon != -1 else len(full_text)
 
-    raw_sql = full_text[start_pos:end_pos].strip()
+    raw_sql = full_text[start_pos:end_pos]
     cleaned = remove_comments(raw_sql).strip()
 
-    debug_log(f"SQL to execute (from block):\n{cleaned}")
-    return cleaned
+    return cleaned, start_pos, start_pos + len(cleaned)
+
 
 def remove_comments(sql):
     sql = re.sub(r'--.*?$', '', sql, flags=re.MULTILINE)   # Single-line comments
@@ -1330,8 +1332,11 @@ search_entry.pack(fill="x", padx=10)
 sql_filter_var.trace_add("write", filter_sql_tree)
 
 # ---- SQL Sheet List Section ----
+ttk.Label(tab_sql_editor, text="🗂️ Below is the list of your saved SQL sheets. Select one to load, or use the search above to filter by name or creator.",
+          foreground="gray").pack(anchor="w", padx=10, pady=(2, 0))
+
 sql_section_label = ttk.Label(tab_sql_editor, text="Saved SQL Sheets", font=("Segoe UI", 10, "bold"))
-sql_section_label.pack(anchor="w", padx=10, pady=(10, 0))
+sql_section_label.pack(anchor="w", padx=10, pady=(5, 0))
 
 sql_tree_frame = ttk.Frame(tab_sql_editor)
 sql_tree_frame.pack(fill="x", padx=10, pady=5)
@@ -1358,10 +1363,17 @@ sql_tree.column("Created By", width=150, anchor="w")
 sql_tree.bind("<<TreeviewSelect>>", on_sql_select)
 
 # ---- SQL Editor Section ----
+ttk.Label(tab_sql_editor, text="💡 Give a name to your SQL query below to save or update it later.",
+          foreground="gray").pack(anchor="w", padx=10, pady=(10, 0))
+
 sql_name_label = ttk.Label(tab_sql_editor, text="SQL Name", font=("Segoe UI", 10, "bold"))
-sql_name_label.pack(anchor="w", padx=10, pady=(10, 0))
+sql_name_label.pack(anchor="w", padx=10, pady=(0, 0))
 sql_name_entry = ttk.Entry(tab_sql_editor)
 sql_name_entry.pack(fill="x", padx=10, pady=(0, 5))
+sql_name_entry.insert(0, "e.g., Active Users Query")
+
+ttk.Label(tab_sql_editor, text="✏️ Write or edit your SQL queries below. The query at the cursor position will be executed.",
+          foreground="gray").pack(anchor="w", padx=10, pady=(0, 2))
 
 editor_label = ttk.Label(tab_sql_editor, text="SQL Editor", font=("Segoe UI", 10, "bold"))
 editor_label.pack(anchor="w", padx=10)
@@ -1400,6 +1412,67 @@ def update_line_numbers(event=None):
 editor.bind("<KeyRelease>", lambda e: (apply_syntax_highlighting(), update_line_numbers()))
 editor.bind("<MouseWheel>", update_line_numbers)
 editor.bind("<ButtonRelease>", update_line_numbers)
+
+# ---- SQL Help Panel ----
+help_paned = ttk.PanedWindow(tab_sql_editor, orient=tk.VERTICAL)
+help_paned.pack(fill="both", expand=False, padx=10, pady=(0, 10))
+
+help_frame = ttk.Labelframe(help_paned, text="📘 SQL Help", padding=10)
+help_text = tk.Text(help_frame, wrap="word", height=10)
+help_scroll = ttk.Scrollbar(help_frame, command=help_text.yview)
+help_text.config(yscrollcommand=help_scroll.set)
+help_text.pack(side="left", fill="both", expand=True)
+help_scroll.pack(side="right", fill="y")
+
+# Add initial help text
+help_intro_text = (
+    "Welcome to SQL Help!\n\n"
+    "Type a SQL keyword (e.g., SELECT, JOIN, INSERT) in the search box\n"
+    "and press Enter to view syntax help or access quick learning links.\n"
+    "If the topic is not available, an external link will be suggested.\n"
+    "\nHappy querying!"
+)
+help_text.insert("1.0", help_intro_text)
+
+help_frame.pack(fill="both", expand=True)
+help_paned.add(help_frame)
+help_paned.forget(help_frame)  # Initially hide the help panel
+
+
+help_topics = {
+    "SELECT": "The SELECT statement is used to fetch data from a database.\n\nExample:\nSELECT * FROM users;",
+    "JOIN": "JOIN is used to combine rows from two or more tables.\n\nExample:\nSELECT * FROM users u JOIN orders o ON u.id = o.user_id;",
+    "INSERT": "INSERT is used to add new rows.\n\nExample:\nINSERT INTO users(name, email) VALUES ('Alice', 'alice@example.com');",
+    "UPDATE": "UPDATE modifies existing rows.\n\nExample:\nUPDATE users SET name = 'Bob' WHERE id = 1;",
+    "DELETE": "DELETE removes rows.\n\nExample:\nDELETE FROM users WHERE id = 1;",
+    "CREATE": "CREATE defines new objects like tables, views, etc.\n\nExample:\nCREATE TABLE students (id NUMBER, name VARCHAR2(50));"
+}
+
+def search_help(event=None):
+    term = help_search_var.get().strip().upper()
+    text = help_topics.get(term, f"No help found for '{term}'.\nYou can check: https://www.w3schools.com/sql/sql_{term.lower()}.asp")
+    help_text.delete("1.0", tk.END)
+    help_text.insert(tk.END, text)
+
+help_search_var = tk.StringVar()
+help_search_entry = ttk.Entry(help_frame, textvariable=help_search_var)
+help_search_entry.pack(fill="x", side="top", pady=(0, 5))
+help_search_entry.bind("<Return>", search_help)
+
+help_visible = tk.BooleanVar(value=False)
+
+def toggle_help():
+    if help_visible.get():
+        help_frame.pack_forget()
+        help_visible.set(False)
+        toggle_btn.config(text="Show Help")
+    else:
+        help_frame.pack(fill="both", expand=True)
+        help_visible.set(True)
+        toggle_btn.config(text="Hide Help")
+
+toggle_btn = ttk.Button(tab_sql_editor, text="Show Help", command=toggle_help)
+toggle_btn.pack(pady=(0, 5), padx=10, anchor="e")
 
 
 # Track unsaved changes
