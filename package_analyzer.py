@@ -966,6 +966,13 @@ def update_sql_sheet(sql_id, content):
 def delete_sql_sheet(sql_id):
     execute_query("DELETE FROM MY_SQL_SHEETS WHERE id = :1", [sql_id])
 
+def on_scroll(*args):
+    editor.yview(*args)
+    line_numbers.yview(*args)
+
+def on_key_or_mouse(event=None):
+    update_line_numbers()
+
 def run_sql_query(query):
     debug_log("Establishing connection for SQL execution...")
     conn, _ = connect()
@@ -1048,9 +1055,30 @@ def on_sql_select(event=None):
         editor.insert(tk.END, content if content else "")
         apply_syntax_highlighting()
 
+def select_sql_block_in_editor(sql_text):
+    editor.tag_remove(tk.SEL, "1.0", tk.END)  # Clear previous selection
+
+    if not sql_text.strip():
+        return
+
+    # Search for the SQL text in editor content
+    start_idx = editor.search(sql_text, "1.0", tk.END, nocase=True, regexp=False)
+
+    if not start_idx:
+        return  # Not found
+
+    # Calculate end index based on length of sql_text
+    end_idx = editor.index(f"{start_idx} + {len(sql_text)}c")
+
+    editor.tag_add(tk.SEL, start_idx, end_idx)
+    editor.mark_set(tk.INSERT, end_idx)
+    editor.see(start_idx)
+    editor.focus_set()
 
 def run_sql():
     query = extract_sql_from_cursor()
+    select_sql_block_in_editor(query)
+
     if not query:
         messagebox.showwarning("Empty Query", "No SQL found to run from cursor position.")
         return
@@ -1338,12 +1366,41 @@ sql_name_entry.pack(fill="x", padx=10, pady=(0, 5))
 editor_label = ttk.Label(tab_sql_editor, text="SQL Editor", font=("Segoe UI", 10, "bold"))
 editor_label.pack(anchor="w", padx=10)
 
+# --- Line Numbered SQL Editor ---
 editor_frame = ttk.Frame(tab_sql_editor)
 editor_frame.pack(fill="both", expand=True, padx=10, pady=(0, 5))
 
-editor = scrolledtext.ScrolledText(editor_frame, height=12, wrap=tk.WORD, font=("Courier New", 10))
-editor.pack(fill="both", expand=True)
-editor.bind("<KeyRelease>", apply_syntax_highlighting)
+# Vertical scrollbar
+scrollbar = ttk.Scrollbar(editor_frame, orient="vertical")
+
+# Line numbers (left)
+line_numbers = tk.Text(editor_frame, width=4, padx=4, takefocus=0, border=0,
+                       background='#F0F0F0', state='disabled', wrap='none')
+line_numbers.pack(side="left", fill="y")
+
+# SQL editor (right)
+editor = tk.Text(editor_frame, wrap=tk.WORD, font=("Courier New", 10), undo=True,
+                 yscrollcommand=scrollbar.set)
+editor.pack(side="left", fill="both", expand=True)
+
+# Scrollbar on the far right
+scrollbar.config(command=lambda *args: (editor.yview(*args), line_numbers.yview(*args)))
+scrollbar.pack(side="right", fill="y")
+
+# Keep line numbers in sync
+def update_line_numbers(event=None):
+    lines = editor.get("1.0", "end-1c").split("\n")
+    nums = "\n".join(f"{i+1}" for i in range(len(lines)))
+    line_numbers.config(state="normal")
+    line_numbers.delete("1.0", tk.END)
+    line_numbers.insert("1.0", nums)
+    line_numbers.config(state="disabled")
+    line_numbers.yview_moveto(editor.yview()[0])
+
+editor.bind("<KeyRelease>", lambda e: (apply_syntax_highlighting(), update_line_numbers()))
+editor.bind("<MouseWheel>", update_line_numbers)
+editor.bind("<ButtonRelease>", update_line_numbers)
+
 
 # Track unsaved changes
 unsaved_label = ttk.Label(tab_sql_editor, text="", foreground="red")
